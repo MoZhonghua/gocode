@@ -136,7 +136,33 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 		i.logf("no gcexportdata file for %s", path)
 		// If there is no export data, check the cache.
 
+		if ok {
+			if entry.sourceInfo == nil || entry.sourceInfo.stale == false {
+				i.logf("use cache for package: %s", path)
+				return entry.pkg, nil
+			} else {
+				i.logf("package source files changed, evit cache for package: %s", path)
+				i.evict(path)
+			}
+		}
+
+		// If there is no cache entry or cache entry is outdated and the
+		// user has configured the correct setting, import and cache
+		// using the source importer.
+		var pkg *types.Package
 		var err error
+		if i.fallbackToSource {
+			i.logf("cache: falling back to the source importer for %s", path)
+			pkg, err = goimporter.For("source", nil).Import(path)
+		} else {
+			i.logf("cache: falling back to the source default for %s", path)
+			pkg, err = goimporter.Default().Import(path)
+		}
+		if pkg == nil {
+			i.logf("failed to fall back to another importer for %s: %v", pkg, err)
+			return nil, err
+		}
+
 		// Digest package source files' timestamp, evit it if changed
 		goListPkg, err := RunGoList(i.ctx, path)
 		if err != nil {
@@ -150,37 +176,8 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 			return nil, err
 		}
 
-		if ok {
-			if entry.sourceInfo.digest == digest {
-				i.logf("use cache for package: %s", path)
-				return entry.pkg, nil
-			} else {
-				i.logf("package source files changed, evit cache for package: %s", path)
-				i.evict(path)
-			}
-		}
-
-		// If there is no cache entry or cache entry is outdated and the
-		// user has configured the correct setting, import and cache
-		// using the source importer.
-		var pkg *types.Package
-		if i.fallbackToSource {
-			i.logf("cache: falling back to the source importer for %s", path)
-			pkg, err = goimporter.For("source", nil).Import(path)
-		} else {
-			i.logf("cache: falling back to the source default for %s", path)
-			pkg, err = goimporter.Default().Import(path)
-		}
-		if pkg == nil {
-			i.logf("failed to fall back to another importer for %s: %v", pkg, err)
-			return nil, err
-		}
-
-		if importCache.notifer != nil {
-			importCache.notifer.AddPath(goListPkg.Dir)
-		}
 		entry = importCacheEntry{pkg, time.Now(), &pkgSourceInfo{digest, goListPkg.Dir, false}}
-		i.imports[path] = entry
+		importCache.add(path, entry)
 		return entry.pkg, nil
 	}
 
@@ -206,7 +203,7 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 			return nil, err
 		}
 		entry = importCacheEntry{pkg, fi.ModTime(), nil}
-		i.imports[path] = entry
+		importCache.add(path, entry)
 	}
 
 	return entry.pkg, nil
@@ -228,6 +225,13 @@ func (i *importerCache) evict(path string) {
 	delete(i.imports, path)
 	if i.notifer != nil {
 		i.notifer.RemovePath(path)
+	}
+}
+
+func (i *importerCache) add(path string, entry importCacheEntry) {
+	i.imports[path] = entry
+	if importCache.notifer != nil && entry.sourceInfo != nil {
+		importCache.notifer.AddPath(entry.sourceInfo.dir)
 	}
 }
 
