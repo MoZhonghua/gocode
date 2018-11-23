@@ -80,12 +80,23 @@ type importer struct {
 type importerCache struct {
 	fset    *token.FileSet
 	imports map[string]importCacheEntry
+	notifer *Notifier
+	logf    func(string, ...interface{})
+	once    sync.Once
+}
+
+// for packages imported from source
+type pkgSourceInfo struct {
+	digest string // digest of source files
+	dir    string // source path of the package
+	stale  bool
 }
 
 type importCacheEntry struct {
-	pkg    *types.Package
-	mtime  time.Time
-	digest string
+	pkg   *types.Package
+	mtime time.Time
+
+	sourceInfo *pkgSourceInfo
 }
 
 func (i *importer) Import(importPath string) (*types.Package, error) {
@@ -140,12 +151,12 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 		}
 
 		if ok {
-			if entry.digest == digest {
+			if entry.sourceInfo.digest == digest {
 				i.logf("use cache for package: %s", path)
 				return entry.pkg, nil
 			} else {
 				i.logf("package source files changed, evit cache for package: %s", path)
-				delete(i.imports, path)
+				i.evict(path)
 			}
 		}
 
@@ -164,7 +175,11 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 			i.logf("failed to fall back to another importer for %s: %v", pkg, err)
 			return nil, err
 		}
-		entry = importCacheEntry{pkg, time.Now(), digest}
+
+		if importCache.notifer != nil {
+			importCache.notifer.AddPath(goListPkg.Dir)
+		}
+		entry = importCacheEntry{pkg, time.Now(), &pkgSourceInfo{digest, goListPkg.Dir, false}}
 		i.imports[path] = entry
 		return entry.pkg, nil
 	}
@@ -190,7 +205,7 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 		if err != nil {
 			return nil, err
 		}
-		entry = importCacheEntry{pkg, fi.ModTime(), ""}
+		entry = importCacheEntry{pkg, fi.ModTime(), nil}
 		i.imports[path] = entry
 	}
 
@@ -204,7 +219,56 @@ func (i *importerCache) clean() {
 		if len(i.imports) <= 100 {
 			break
 		}
-		delete(i.imports, k)
+
+		i.evict(k)
+	}
+}
+
+func (i *importerCache) evict(path string) {
+	delete(i.imports, path)
+	if i.notifer != nil {
+		i.notifer.RemovePath(path)
+	}
+}
+
+func InitImportCache(logger func(string, ...interface{})) {
+	importCache.initOnce(logger)
+}
+
+func (i *importerCache) initOnce(logger func(string, ...interface{})) {
+	i.once.Do(func() {
+		i.logf = logger
+		notifer, err := NewNotifer(logger)
+		if err != nil {
+			return
+		}
+
+		i.notifer = notifer
+		go i.runNotify()
+	})
+}
+
+func (i *importerCache) runNotify() {
+	for {
+		ev := <-i.notifer.Events
+		slashed := filepath.ToSlash(filepath.Dir(ev.Name))
+		pos := strings.LastIndex(slashed, "/src/")
+		if pos < 0 {
+			continue
+		}
+
+		i.logf("cache: file change: %v", ev)
+
+		pkgName := slashed[pos+5:]
+		i.logf("outdate package: %s", pkgName)
+
+		Mu.Lock()
+		if entry, ok := i.imports[pkgName]; ok {
+			if entry.sourceInfo != nil {
+				entry.sourceInfo.stale = true
+			}
+		}
+		Mu.Unlock()
 	}
 }
 

@@ -18,7 +18,7 @@ import (
 	"github.com/mdempsky/gocode/internal/suggest"
 )
 
-func doServer(cache bool) {
+func doServer(useCache bool) {
 	addr := *g_addr
 	if *g_sock == "unix" {
 		addr = getSocketPath()
@@ -36,8 +36,16 @@ func doServer(cache bool) {
 		exitServer()
 	}()
 
+	if useCache {
+		logf := func(string, ...interface{}) {}
+		if *g_debug {
+			logf = log.Printf
+			cache.InitImportCache(logf)
+		}
+	}
+
 	if err = rpc.Register(&Server{
-		cache: cache,
+		cache: useCache,
 	}); err != nil {
 		log.Fatal(err)
 	}
