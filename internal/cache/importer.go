@@ -1,13 +1,18 @@
 package cache
 
 import (
+	"crypto/md5"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"go/build"
 	goimporter "go/importer"
 	"go/token"
 	"go/types"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -78,8 +83,9 @@ type importerCache struct {
 }
 
 type importCacheEntry struct {
-	pkg   *types.Package
-	mtime time.Time
+	pkg    *types.Package
+	mtime  time.Time
+	digest string
 }
 
 func (i *importer) Import(importPath string) (*types.Package, error) {
@@ -113,18 +119,40 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 
 	i.logf("importing: %v, srcdir: %v", importPath, srcDir)
 	filename, path := gcexportdata.Find(importPath, srcDir)
+
 	entry, ok := i.imports[path]
 	if filename == "" {
 		i.logf("no gcexportdata file for %s", path)
 		// If there is no export data, check the cache.
-		// TODO(rstambler): Develop a better heuristic for entry eviction.
-		if ok && time.Since(entry.mtime) <= time.Minute*20 {
-			return entry.pkg, nil
-		}
-		// If there is no cache entry and the user has configured the correct
-		// setting, import and cache using the source importer.
-		var pkg *types.Package
+
 		var err error
+		// Digest package source files' timestamp, evit it if changed
+		goListPkg, err := RunGoList(i.ctx, path)
+		if err != nil {
+			i.logf("failed to run go list on package: %s: %v", path, err)
+			return nil, err
+		}
+
+		digest, err := digestPackageFilesTimestamp(goListPkg)
+		if err != nil {
+			i.logf("failed to digest package source files: %s: %v", path, err)
+			return nil, err
+		}
+
+		if ok {
+			if entry.digest == digest {
+				i.logf("use cache for package: %s", path)
+				return entry.pkg, nil
+			} else {
+				i.logf("package source files changed, evit cache for package: %s", path)
+				delete(i.imports, path)
+			}
+		}
+
+		// If there is no cache entry or cache entry is outdated and the
+		// user has configured the correct setting, import and cache
+		// using the source importer.
+		var pkg *types.Package
 		if i.fallbackToSource {
 			i.logf("cache: falling back to the source importer for %s", path)
 			pkg, err = goimporter.For("source", nil).Import(path)
@@ -136,12 +164,14 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 			i.logf("failed to fall back to another importer for %s: %v", pkg, err)
 			return nil, err
 		}
-		entry = importCacheEntry{pkg, time.Now()}
+		entry = importCacheEntry{pkg, time.Now(), digest}
 		i.imports[path] = entry
 		return entry.pkg, nil
 	}
 
 	// If there is export data for the package.
+	// TODO: maybe fallback to source importer if 'go list' report this
+	// package is stale
 	fi, err := os.Stat(filename)
 	if err != nil {
 		i.logf("could not stat %s", filename)
@@ -160,7 +190,7 @@ func (i *importer) ImportFrom(importPath, srcDir string, mode types.ImportMode) 
 		if err != nil {
 			return nil, err
 		}
-		entry = importCacheEntry{pkg, fi.ModTime()}
+		entry = importCacheEntry{pkg, fi.ModTime(), ""}
 		i.imports[path] = entry
 	}
 
@@ -215,4 +245,52 @@ func (i *importer) joinPath(elem ...string) string {
 func match(s, prefix string) (string, bool) {
 	rest := strings.TrimPrefix(s, prefix)
 	return rest, len(rest) < len(s)
+}
+
+func digestPackageFilesTimestamp(pkg *Package) (string, error) {
+	h := md5.New()
+	filesList := [][]string{
+		pkg.GoFiles,
+		pkg.CgoFiles,
+		pkg.CompiledGoFiles,
+		pkg.IgnoredGoFiles,
+		pkg.CFiles,
+		pkg.CXXFiles,
+		pkg.MFiles,
+		pkg.HFiles,
+		pkg.FFiles,
+		pkg.SFiles,
+		pkg.SwigFiles,
+		pkg.SwigCXXFiles,
+		pkg.SysoFiles,
+		pkg.TestGoFiles,
+		pkg.XTestGoFiles,
+	}
+
+	srcDir := path.Join(pkg.Root, "src", pkg.ImportPath)
+	buf := make([]byte, 8)
+	for _, files := range filesList {
+		sort.Strings(files)
+		for _, f := range files {
+			h.Write([]byte(f))
+			ts, err := fileTimestamp(path.Join(srcDir, f))
+			if err != nil {
+				return "", err
+			}
+
+			binary.LittleEndian.PutUint64(buf, ts)
+			h.Write(buf)
+		}
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func fileTimestamp(f string) (uint64, error) {
+	fi, err := os.Stat(f)
+	if err != nil {
+		return 0, err
+	}
+
+	return uint64(fi.ModTime().UnixNano()), nil
 }
